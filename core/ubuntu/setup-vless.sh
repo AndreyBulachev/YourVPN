@@ -174,8 +174,12 @@ UUID=$(xray uuid) || die "Failed to generate UUID"
 ok "UUID:       ${UUID}"
 
 KEY_OUTPUT=$(xray x25519 2>&1) || die "Failed to generate x25519 keypair"
-PRIVATE_KEY=$(awk -F': ' '/[Pp]rivate key/{print $2; exit}' <<< "$KEY_OUTPUT")
-PUBLIC_KEY=$(awk  -F': ' '/[Pp]ublic key/{print $2; exit}'  <<< "$KEY_OUTPUT")
+# Supports both output formats:
+#   old (≤v1.x):  "Private key: ..."        / "Public key: ..."
+#   new (v25.x+): "PrivateKey: ..."         / "Password (PublicKey): ..."
+# Note: new format has ")" between "Key" and ":", so we match without the colon.
+PRIVATE_KEY=$(awk -F': ' '/PrivateKey|[Pp]rivate key/{print $2; exit}' <<< "$KEY_OUTPUT")
+PUBLIC_KEY=$(awk  -F': ' '/PublicKey|[Pp]ublic key/{print $2; exit}'   <<< "$KEY_OUTPUT")
 
 if [[ -z "$PRIVATE_KEY" ]]; then
     die "Could not parse private key from xray x25519 output.\nRaw output was:\n${KEY_OUTPUT}"
