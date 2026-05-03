@@ -16,6 +16,9 @@ readonly XRAY_LOG_DIR="/var/log/xray"
 readonly SYSCTL_CONF="/etc/sysctl.d/99-xray.conf"
 readonly CLIENT_OUTPUT="/root/xray-client.txt"
 readonly VLESS_PORT=443
+# Pin Xray version by setting XRAY_TARGET_VERSION before running (e.g. XRAY_TARGET_VERSION=v1.8.24).
+# Leave empty to install the latest release.
+readonly XRAY_TARGET_VERSION="${XRAY_TARGET_VERSION:-}"
 readonly PRESET_SITES=(
     "www.microsoft.com"
     "www.samsung.com"
@@ -97,18 +100,20 @@ ok "Utilities installed"
 # =============================================================================
 step "Step 3/10 — Configuring UFW firewall"
 
-# Detect actual SSH port to avoid locking ourselves out
-SSH_PORT="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+# Detect actual SSH port — sshd -T resolves all Include directives
+SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
+if [[ -z "$SSH_PORT" ]]; then
+    SSH_PORT="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+fi
 SSH_PORT="${SSH_PORT:-22}"
 info "SSH port detected: ${SSH_PORT}"
 
 ufw allow "${SSH_PORT}/tcp" comment "SSH"
 ufw allow "${VLESS_PORT}/tcp" comment "VLESS/Reality"
-ufw allow "${VLESS_PORT}/udp" comment "VLESS/Reality UDP"
 ufw --force enable
 
 ufw status verbose
-ok "Firewall active: SSH (${SSH_PORT}/tcp) and VLESS (${VLESS_PORT}/tcp,udp) open"
+ok "Firewall active: SSH (${SSH_PORT}/tcp) and VLESS (${VLESS_PORT}/tcp) open"
 
 # =============================================================================
 # STEP 4/10 — BBR + Kernel network optimization
@@ -130,7 +135,7 @@ net.core.somaxconn               = 4096
 net.ipv4.ip_local_port_range     = 1024 65535
 EOF
 
-sysctl --system > /dev/null 2>&1
+sysctl --system > /dev/null
 
 BBR_ACTIVE=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
 if [[ "$BBR_ACTIVE" == "bbr" ]]; then
@@ -145,7 +150,9 @@ ok "Kernel TCP parameters written to ${SYSCTL_CONF}"
 # =============================================================================
 step "Step 5/10 — Installing Xray-core"
 
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install \
+XRAY_INSTALL_ARGS=(install)
+[[ -n "$XRAY_TARGET_VERSION" ]] && XRAY_INSTALL_ARGS+=(--version "$XRAY_TARGET_VERSION")
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ "${XRAY_INSTALL_ARGS[@]}" \
     || die "Xray installation script failed"
 
 command -v xray > /dev/null 2>&1 || die "xray binary not found after installation"
@@ -202,6 +209,20 @@ else
 fi
 
 [[ -n "$SERVER_ADDRESS" ]] || die "Server address is required for the client link."
+
+# Validate format: allow IPv4, hostname, domain, or bare IPv6
+if [[ ! "$SERVER_ADDRESS" =~ ^[a-zA-Z0-9._-]+$  && \
+      ! "$SERVER_ADDRESS" =~ ^[0-9a-fA-F:]+$ ]]; then
+    die "Invalid server address '${SERVER_ADDRESS}'. Use an IPv4, IPv6, or domain name."
+fi
+
+# For VLESS URI: IPv6 addresses must be wrapped in brackets
+if [[ "$SERVER_ADDRESS" =~ : ]]; then
+    SERVER_ADDRESS_URI="[${SERVER_ADDRESS}]"
+else
+    SERVER_ADDRESS_URI="$SERVER_ADDRESS"
+fi
+
 ok "Server address: ${SERVER_ADDRESS}"
 
 # =============================================================================
@@ -378,7 +399,9 @@ cat > "$XRAY_CONFIG" << XRAY_CONFIG_EOF
 }
 XRAY_CONFIG_EOF
 
-chmod 644 "$XRAY_CONFIG"
+# 640: root owns, xray service (nobody:nogroup) can read, world cannot
+chown root:nogroup "$XRAY_CONFIG" 2>/dev/null || chown root "$XRAY_CONFIG"
+chmod 640 "$XRAY_CONFIG"
 ok "Config written: ${XRAY_CONFIG}"
 
 # =============================================================================
@@ -436,7 +459,7 @@ fi
 # =============================================================================
 step "Generating client configuration"
 
-VLESS_URI="vless://${UUID}@${SERVER_ADDRESS}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_SITE}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#MyVPN"
+VLESS_URI="vless://${UUID}@${SERVER_ADDRESS_URI}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_SITE}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#MyVPN"
 
 # Save to file (chmod 600 — root only)
 cat > "$CLIENT_OUTPUT" << EOF
