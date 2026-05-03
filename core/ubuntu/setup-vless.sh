@@ -4,17 +4,19 @@
 #  Ubuntu/Debian | Port 443 | Sections 2.3 and 3 of C1-vpn-theory-and-setup.md
 # =============================================================================
 
-set -uo pipefail
+set -Eeuo pipefail
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-XRAY_CONFIG="/usr/local/etc/xray/config.json"
-XRAY_LOG_DIR="/var/log/xray"
-VLESS_PORT=443
-PRESET_SITES=(
+readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
+readonly XRAY_LOG_DIR="/var/log/xray"
+readonly SYSCTL_CONF="/etc/sysctl.d/99-xray.conf"
+readonly CLIENT_OUTPUT="/root/xray-client.txt"
+readonly VLESS_PORT=443
+readonly PRESET_SITES=(
     "www.microsoft.com"
     "www.samsung.com"
     "www.asus.com"
@@ -34,12 +36,19 @@ info() { echo -e "${CYAN}  ℹ $1${NC}"; }
 warn() { echo -e "${YELLOW}  ⚠ $1${NC}"; }
 die()  { echo -e "${RED}  ✗ FATAL: $1${NC}" >&2; exit 1; }
 
+confirm() {
+    local answer
+    read -r -p "$1 [y/N]: " answer
+    [[ "$answer" =~ ^[YyДд]$ ]]
+}
+
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && die "Run as root: sudo bash $0"
 
 if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
     source /etc/os-release
-    [[ "$ID" != "ubuntu" && "$ID" != "debian" ]] && die "Requires Ubuntu or Debian (detected: $ID)"
+    [[ "$ID" != "ubuntu" && "$ID" != "debian" ]] && die "Requires Ubuntu or Debian (detected: ${ID:-unknown})"
 else
     die "Cannot detect OS (/etc/os-release missing)"
 fi
@@ -54,138 +63,151 @@ cat << 'BANNER'
 BANNER
 echo -e "${NC}"
 
-# =============================================================================
-# STEP 1 — System Update
-# =============================================================================
-step "Step 1/11 — System update"
+warn "This script will modify firewall, sysctl, install Xray and overwrite ${XRAY_CONFIG}."
+confirm "Continue with installation?" || die "Installation cancelled."
 
-apt-get update -y
-apt-get upgrade -y
-apt-get autoremove -y
+# =============================================================================
+# STEP 1/10 — System Update
+# =============================================================================
+step "Step 1/10 — System update"
+
+DEBIAN_FRONTEND=noninteractive apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
 
 ok "System packages updated"
 
 # =============================================================================
-# STEP 2 — Install utilities
+# STEP 2/10 — Install utilities
 # =============================================================================
-step "Step 2/11 — Installing required utilities"
+step "Step 2/10 — Installing required utilities"
 
 PACKAGES=(
-    curl wget git vim nano htop net-tools
-    netcat-openbsd iputils-ping telnet
-    openssl ufw qrencode
+    ca-certificates curl wget htop net-tools
+    netcat-openbsd iputils-ping
+    openssl jq ufw qrencode
 )
 
-apt-get install -y "${PACKAGES[@]}"
+DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKAGES[@]}"
 
-ok "Utilities installed: ${PACKAGES[*]}"
+ok "Utilities installed"
 
 # =============================================================================
-# STEP 3 — Firewall (UFW)
+# STEP 3/10 — Firewall (UFW)
 # =============================================================================
-step "Step 3/11 — Configuring UFW firewall"
+step "Step 3/10 — Configuring UFW firewall"
 
-ufw allow 22/tcp    comment "SSH"
-ufw allow 443/tcp   comment "VLESS/Reality"
-ufw allow 443/udp   comment "VLESS/Reality UDP"
+# Detect actual SSH port to avoid locking ourselves out
+SSH_PORT="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+SSH_PORT="${SSH_PORT:-22}"
+info "SSH port detected: ${SSH_PORT}"
+
+ufw allow "${SSH_PORT}/tcp" comment "SSH"
+ufw allow "${VLESS_PORT}/tcp" comment "VLESS/Reality"
+ufw allow "${VLESS_PORT}/udp" comment "VLESS/Reality UDP"
 ufw --force enable
 
 ufw status verbose
-ok "Firewall active: SSH (22/tcp) and VLESS (443/tcp,udp) open"
+ok "Firewall active: SSH (${SSH_PORT}/tcp) and VLESS (${VLESS_PORT}/tcp,udp) open"
 
 # =============================================================================
-# STEP 4 — Enable BBR
+# STEP 4/10 — BBR + Kernel network optimization
 # =============================================================================
-step "Step 4/11 — Enabling BBR TCP congestion control"
+step "Step 4/10 — BBR + kernel network optimization"
 
-# Remove stale entries to avoid duplication on re-runs
-sed -i '/^net\.core\.default_qdisc/d'           /etc/sysctl.conf
-sed -i '/^net\.ipv4\.tcp_congestion_control/d'  /etc/sysctl.conf
+cat > "$SYSCTL_CONF" << 'EOF'
+# Xray VLESS Reality — TCP tuning
+net.core.default_qdisc           = fq
+net.ipv4.tcp_congestion_control  = bbr
+net.ipv4.tcp_rmem                = 4096 87380 67108864
+net.ipv4.tcp_wmem                = 4096 65536 67108864
+net.core.rmem_max                = 67108864
+net.core.wmem_max                = 67108864
+net.ipv4.tcp_max_syn_backlog     = 4096
+net.core.netdev_max_backlog      = 4096
+net.ipv4.tcp_tw_reuse            = 1
+net.core.somaxconn               = 4096
+net.ipv4.ip_local_port_range     = 1024 65535
+EOF
 
-{
-    echo "net.core.default_qdisc=fq"
-    echo "net.ipv4.tcp_congestion_control=bbr"
-} >> /etc/sysctl.conf
-
-sysctl -p > /dev/null 2>&1
+sysctl --system > /dev/null 2>&1
 
 BBR_ACTIVE=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
 if [[ "$BBR_ACTIVE" == "bbr" ]]; then
     ok "BBR enabled (tcp_congestion_control=bbr)"
 else
-    warn "BBR may not be active (current: $BBR_ACTIVE). The kernel might need a reboot."
+    warn "BBR not yet active (current: ${BBR_ACTIVE}) — may require a reboot."
 fi
+ok "Kernel TCP parameters written to ${SYSCTL_CONF}"
 
 # =============================================================================
-# STEP 5 — Kernel network optimization
+# STEP 5/10 — Install Xray-core
 # =============================================================================
-step "Step 5/11 — Optimizing kernel network parameters"
-
-# Remove previous block if re-running the script
-sed -i '/# >>> VPN Network Optimization >>>/,/# <<< VPN Network Optimization <<</d' /etc/sysctl.conf
-
-cat >> /etc/sysctl.conf << 'SYSCTL'
-
-# >>> VPN Network Optimization >>>
-net.ipv4.tcp_rmem           = 4096 87380 67108864
-net.ipv4.tcp_wmem           = 4096 65536 67108864
-net.core.rmem_max           = 67108864
-net.core.wmem_max           = 67108864
-net.ipv4.tcp_max_syn_backlog = 4096
-net.core.netdev_max_backlog  = 4096
-net.ipv4.tcp_tw_reuse       = 1
-net.core.somaxconn           = 4096
-net.ipv4.ip_local_port_range = 1024 65535
-# <<< VPN Network Optimization <<<
-SYSCTL
-
-sysctl -p > /dev/null 2>&1
-ok "Kernel TCP buffers and connection limits optimized"
-
-# =============================================================================
-# STEP 6 — Install Xray-core
-# =============================================================================
-step "Step 6/11 — Installing Xray-core"
+step "Step 5/10 — Installing Xray-core"
 
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install \
     || die "Xray installation script failed"
 
-XRAY_VERSION=$(xray -version 2>&1 | head -1) || die "xray binary not found after installation"
-ok "$XRAY_VERSION"
+command -v xray > /dev/null 2>&1 || die "xray binary not found after installation"
+XRAY_VERSION=$(xray -version 2>&1 | head -1)
+ok "${XRAY_VERSION}"
 
-mkdir -p "$XRAY_LOG_DIR"
-# Xray installer creates user 'nobody'; log dir must be writable by it
+install -d -m 755 "$XRAY_LOG_DIR"
 chown nobody:nogroup "$XRAY_LOG_DIR" 2>/dev/null \
     || chown nobody "$XRAY_LOG_DIR" 2>/dev/null \
     || true
-
-ok "Log directory: $XRAY_LOG_DIR"
+ok "Log directory: ${XRAY_LOG_DIR}"
 
 # =============================================================================
-# STEP 7 — Generate UUID, keypair, Short ID
+# STEP 6/10 — Generate UUID, keypair, Short ID
 # =============================================================================
-step "Step 7/11 — Generating keys and UUID"
+step "Step 6/10 — Generating keys and UUID"
 
 UUID=$(xray uuid) || die "Failed to generate UUID"
-ok "UUID:       $UUID"
+ok "UUID:       ${UUID}"
 
 KEY_OUTPUT=$(xray x25519) || die "Failed to generate x25519 keypair"
-PRIVATE_KEY=$(echo "$KEY_OUTPUT" | awk '/[Pp]rivate key/{print $NF}')
-PUBLIC_KEY=$(echo "$KEY_OUTPUT"  | awk '/[Pp]ublic key/{print $NF}')
+PRIVATE_KEY=$(awk -F': ' '/[Pp]rivate key/{print $2}' <<< "$KEY_OUTPUT")
+PUBLIC_KEY=$(awk  -F': ' '/[Pp]ublic key/{print $2}'  <<< "$KEY_OUTPUT")
 
 [[ -z "$PRIVATE_KEY" ]] && die "Could not parse private key from xray x25519 output"
 [[ -z "$PUBLIC_KEY"  ]] && die "Could not parse public key from xray x25519 output"
 
-ok "Public key: $PUBLIC_KEY"
-info "Private key stored only in server config (not shown here)"
+ok "Public key: ${PUBLIC_KEY}"
+info "Private key stored only in server config"
 
 SHORT_ID=$(openssl rand -hex 8) || die "Failed to generate Short ID"
-ok "Short ID:   $SHORT_ID"
+ok "Short ID:   ${SHORT_ID}"
 
 # =============================================================================
-# STEP 8 — Select dest site for Reality
+# STEP 7/10 — Detect server address
 # =============================================================================
-step "Step 8/11 — Selecting dest site for Reality masking"
+step "Step 7/10 — Server address"
+
+DETECTED_IP=""
+for SVC in "https://api.ipify.org" "https://ifconfig.me" "https://ipv4.icanhazip.com"; do
+    set +e
+    DETECTED_IP=$(curl -4 -s --max-time 8 "$SVC" 2>/dev/null | tr -d '[:space:]')
+    set -e
+    [[ "$DETECTED_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+    DETECTED_IP=""
+done
+
+if [[ -n "$DETECTED_IP" ]]; then
+    read -rp "  Server address [${DETECTED_IP}]: " SERVER_ADDRESS
+    SERVER_ADDRESS="${SERVER_ADDRESS:-$DETECTED_IP}"
+else
+    warn "Could not auto-detect public IP."
+    read -rp "  Enter server public IP or domain: " SERVER_ADDRESS
+fi
+
+[[ -n "$SERVER_ADDRESS" ]] || die "Server address is required for the client link."
+ok "Server address: ${SERVER_ADDRESS}"
+
+# =============================================================================
+# STEP 8/10 — Select dest site for Reality
+# =============================================================================
+step "Step 8/10 — Selecting dest site for Reality masking"
 
 # ── Site compatibility checker ─────────────────────────────────────────────
 check_site() {
@@ -193,12 +215,13 @@ check_site() {
     local tls13_ok=false
     local reach_ok=false
 
-    info "Checking $site …"
+    info "Checking ${site} …"
 
-    # TLS 1.3 (mandatory)
+    # TLS 1.3 with SNI (mandatory)
     local tls_out
     set +e
-    tls_out=$(echo "" | timeout 10 openssl s_client -tls1_3 -connect "${site}:443" 2>/dev/null)
+    tls_out=$(echo "" | timeout 10 openssl s_client \
+        -tls1_3 -servername "$site" -connect "${site}:443" 2>/dev/null)
     set -e
     if echo "$tls_out" | grep -q "TLSv1.3"; then
         echo -e "    ${GREEN}✓ TLS 1.3 supported${NC}"
@@ -210,7 +233,7 @@ check_site() {
     # HTTP/2 (strongly recommended, non-blocking)
     set +e
     local h2_hdr
-    h2_hdr=$(curl -sI --http2 "https://${site}" --connect-timeout 10 2>/dev/null | head -1)
+    h2_hdr=$(curl -4 -sI --http2 "https://${site}" --connect-timeout 10 2>/dev/null | head -1)
     set -e
     if echo "$h2_hdr" | grep -qiE "HTTP/2|^HTTP/[0-9.]+ 2"; then
         echo -e "    ${GREEN}✓ HTTP/2 supported${NC}"
@@ -221,14 +244,15 @@ check_site() {
     # Reachability — must return 2xx or 3xx (mandatory)
     set +e
     local http_code
-    http_code=$(curl -o /dev/null -s -w "%{http_code}" --connect-timeout 10 "https://${site}" 2>/dev/null)
+    http_code=$(curl -4 -o /dev/null -s -w "%{http_code}" \
+        --connect-timeout 10 "https://${site}" 2>/dev/null)
     set -e
     http_code="${http_code:-000}"
     if [[ "$http_code" =~ ^[23] ]]; then
-        echo -e "    ${GREEN}✓ Reachable (HTTP $http_code)${NC}"
+        echo -e "    ${GREEN}✓ Reachable (HTTP ${http_code})${NC}"
         reach_ok=true
     else
-        echo -e "    ${RED}✗ Not reachable (HTTP $http_code) — site cannot be used${NC}"
+        echo -e "    ${RED}✗ Not reachable (HTTP ${http_code}) — site cannot be used${NC}"
     fi
 
     $tls13_ok && $reach_ok
@@ -241,10 +265,10 @@ while [[ -z "$DEST_SITE" ]]; do
     echo -e "${BOLD}Choose a dest site for Reality masking:${NC}"
     local_idx=1
     for s in "${PRESET_SITES[@]}"; do
-        echo "  $local_idx) $s"
-        (( local_idx++ ))
+        echo "  ${local_idx}) ${s}"
+        (( local_idx++ )) || true
     done
-    echo "  $local_idx) Enter a custom site"
+    echo "  ${local_idx}) Enter a custom site"
     echo ""
 
     CHOICE=""
@@ -255,29 +279,42 @@ while [[ -z "$DEST_SITE" ]]; do
         CANDIDATE="${PRESET_SITES[$((CHOICE - 1))]}"
     elif [[ "$CHOICE" == "$local_idx" ]]; then
         read -rp "Enter site hostname (e.g. www.example.com): " RAW_SITE
-        # Strip protocol and path
         CANDIDATE="${RAW_SITE#https://}"
         CANDIDATE="${CANDIDATE#http://}"
         CANDIDATE="${CANDIDATE%%/*}"
-        CANDIDATE="${CANDIDATE%:*}"   # strip port if present
+        CANDIDATE="${CANDIDATE%%\?*}"
+        CANDIDATE="${CANDIDATE%%:*}"   # strip port — Reality dest always uses 443
     else
         warn "Invalid choice, please enter a number between 1 and ${local_idx}."
         continue
     fi
 
+    if [[ -z "$CANDIDATE" ]]; then
+        warn "Empty hostname, please try again."
+        continue
+    fi
+
     if check_site "$CANDIDATE"; then
         DEST_SITE="$CANDIDATE"
-        ok "Dest site selected: $DEST_SITE"
+        ok "Dest site selected: ${DEST_SITE}"
     else
-        warn "Site '${CANDIDATE}' did not pass the required checks."
-        warn "Please choose a different site."
+        warn "Site '${CANDIDATE}' did not pass the required checks. Please choose again."
     fi
 done
 
 # =============================================================================
-# STEP 9 — Create Xray server configuration
+# STEP 9/10 — Create Xray server configuration
 # =============================================================================
-step "Step 9/11 — Writing Xray server configuration"
+step "Step 9/10 — Writing Xray server configuration"
+
+# Backup existing config if present
+if [[ -f "$XRAY_CONFIG" ]]; then
+    local_bak="${XRAY_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$XRAY_CONFIG" "$local_bak"
+    info "Existing config backed up to ${local_bak}"
+fi
+
+install -d -m 755 "$(dirname "$XRAY_CONFIG")"
 
 cat > "$XRAY_CONFIG" << XRAY_CONFIG_EOF
 {
@@ -332,15 +369,6 @@ cat > "$XRAY_CONFIG" << XRAY_CONFIG_EOF
       "settings": {
         "domainStrategy": "AsIs"
       }
-    },
-    {
-      "protocol": "blackhole",
-      "tag": "block",
-      "settings": {
-        "response": {
-          "type": "http"
-        }
-      }
     }
   ],
   "dns": {
@@ -350,31 +378,32 @@ cat > "$XRAY_CONFIG" << XRAY_CONFIG_EOF
 }
 XRAY_CONFIG_EOF
 
-ok "Config written: $XRAY_CONFIG"
+chmod 644 "$XRAY_CONFIG"
+ok "Config written: ${XRAY_CONFIG}"
 
 # =============================================================================
-# STEP 10 — Validate configuration
+# STEP 10/10 — Validate config, start service
 # =============================================================================
-step "Step 10/11 — Validating Xray configuration"
+step "Step 10/10 — Validating config and starting Xray service"
 
+# JSON syntax check (fast, precise error messages)
+jq empty "$XRAY_CONFIG" || die "JSON syntax error in config — check ${XRAY_CONFIG}"
+ok "JSON syntax valid"
+
+# Xray semantic check
 set +e
 VALIDATE_OUT=$(xray run -test -config "$XRAY_CONFIG" 2>&1)
 VALIDATE_RC=$?
 set -e
 
 if [[ $VALIDATE_RC -eq 0 ]]; then
-    ok "Configuration passed validation"
+    ok "Xray config validation passed"
 else
-    echo -e "${RED}Validation output:${NC}"
-    echo "$VALIDATE_OUT"
-    die "Config validation failed — check $XRAY_CONFIG"
+    echo -e "${RED}${VALIDATE_OUT}${NC}"
+    die "Xray rejected the config — check ${XRAY_CONFIG}"
 fi
 
-# =============================================================================
-# STEP 11 — Start service and enable autostart
-# =============================================================================
-step "Step 11/11 — Starting Xray service"
-
+# Start service
 systemctl daemon-reload
 systemctl enable xray
 systemctl restart xray
@@ -388,43 +417,43 @@ set -e
 if [[ "$ACTIVE" == "active" ]]; then
     ok "xray.service is running"
 else
-    echo ""
     systemctl status xray --no-pager || true
-    die "Xray service failed to start. Run: journalctl -u xray -n 50"
+    die "Xray failed to start — run: journalctl -u xray -n 50"
 fi
 
-# Also verify port is listening
+# Verify port is listening
 set +e
 PORT_OPEN=$(ss -tlnp | grep ":${VLESS_PORT} " | head -1)
 set -e
 if [[ -n "$PORT_OPEN" ]]; then
     ok "Port ${VLESS_PORT} is listening"
 else
-    warn "Port ${VLESS_PORT} not yet visible in ss output — may need a moment"
+    warn "Port ${VLESS_PORT} not yet in ss output — may need a moment"
 fi
 
 # =============================================================================
-# FINAL — Generate client link and QR code
+# FINAL — Client link, file, QR code
 # =============================================================================
-step "Generating client configuration link and QR code"
+step "Generating client configuration"
 
-# Resolve public IP
-SERVER_IP=""
-for SVC in "https://ifconfig.me" "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
-    set +e
-    SERVER_IP=$(curl -s --max-time 8 "$SVC" 2>/dev/null | tr -d '[:space:]')
-    set -e
-    [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
-    SERVER_IP=""
-done
+VLESS_URI="vless://${UUID}@${SERVER_ADDRESS}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_SITE}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#MyVPN"
 
-if [[ -z "$SERVER_IP" ]]; then
-    warn "Could not auto-detect public IP. Falling back to hostname -I."
-    SERVER_IP=$(hostname -I | awk '{print $1}')
-fi
+# Save to file (chmod 600 — root only)
+cat > "$CLIENT_OUTPUT" << EOF
+Server:      ${SERVER_ADDRESS}
+Port:        ${VLESS_PORT}
+UUID:        ${UUID}
+Public key:  ${PUBLIC_KEY}
+Short ID:    ${SHORT_ID}
+Dest site:   ${DEST_SITE}
+Fingerprint: chrome
 
-VLESS_URI="vless://${UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST_SITE}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#MyVPN"
+${VLESS_URI}
+EOF
+chmod 600 "$CLIENT_OUTPUT"
+ok "Client config saved to ${CLIENT_OUTPUT} (chmod 600)"
 
+# ── Final output ──────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}${GREEN}║                    Setup Complete!                       ║${NC}"
@@ -432,7 +461,7 @@ echo -e "${BOLD}${GREEN}╚═════════════════�
 
 echo ""
 echo -e "${BOLD}── Server Parameters ─────────────────────────────────────────${NC}"
-echo -e "  Server IP   : ${CYAN}${SERVER_IP}${NC}"
+echo -e "  Server      : ${CYAN}${SERVER_ADDRESS}${NC}"
 echo -e "  Port        : ${CYAN}${VLESS_PORT}${NC}"
 echo -e "  UUID        : ${CYAN}${UUID}${NC}"
 echo -e "  Public Key  : ${CYAN}${PUBLIC_KEY}${NC}"
@@ -449,11 +478,12 @@ echo -e "${BOLD}── QR Code (scan with mobile client) ───────�
 qrencode -t ansiutf8 "$VLESS_URI"
 
 echo ""
-echo -e "${BOLD}── Useful Server Commands ────────────────────────────────────${NC}"
+echo -e "${BOLD}── Useful Commands ───────────────────────────────────────────${NC}"
 echo -e "  Status  : ${CYAN}systemctl status xray${NC}"
 echo -e "  Logs    : ${CYAN}journalctl -u xray -f${NC}"
 echo -e "  Restart : ${CYAN}systemctl restart xray${NC}"
 echo -e "  Config  : ${CYAN}${XRAY_CONFIG}${NC}"
+echo -e "  Saved   : ${CYAN}${CLIENT_OUTPUT}${NC}"
 
 echo ""
 echo -e "${BOLD}── Recommended Clients ───────────────────────────────────────${NC}"
