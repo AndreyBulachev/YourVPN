@@ -102,6 +102,47 @@ vless://UUID@SERVER_IP:443?encryption=none&flow=xtls-rprx-vision&security=realit
 
 ---
 
+## Управление пользователями
+
+После установки запустите `manage-users.sh` для добавления, просмотра и удаления пользователей.
+
+```bash
+# Скачать скрипт управления
+curl -O https://raw.githubusercontent.com/AndreyBulachev/YourVPN/master/core/ubuntu/manage-users.sh
+
+# Запустить (интерактивное меню)
+sudo bash manage-users.sh
+```
+
+Или одной командой:
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/AndreyBulachev/YourVPN/master/core/ubuntu/manage-users.sh)"
+```
+
+Скрипт поддерживает как интерактивное меню, так и прямые команды:
+
+```bash
+sudo bash manage-users.sh list              # список пользователей
+sudo bash manage-users.sh info             # просмотр пользователя (с QR-кодом)
+sudo bash manage-users.sh add              # добавить пользователя
+sudo bash manage-users.sh delete           # удалить пользователя
+
+# Можно сразу указать номер или UUID:
+sudo bash manage-users.sh info 2
+sudo bash manage-users.sh delete a1b2c3...
+```
+
+### Что делает скрипт при добавлении пользователя
+
+- Генерирует новый UUID и уникальный Short ID
+- Добавляет пользователя в `/usr/local/etc/xray/config.json`
+- Валидирует конфиг (`xray run -test`) и перезапускает Xray
+- Сохраняет метаданные (имя, Short ID, дата) в `/root/xray-users-meta.json`
+- Выводит готовую VLESS-ссылку и QR-код
+
+---
+
 ## Управление сервисом
 
 ```bash
