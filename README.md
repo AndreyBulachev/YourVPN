@@ -12,7 +12,7 @@ Bash-скрипт для автоматической установки и на
 |-----|----------|
 | 1 | Обновление системы (`apt update && upgrade`) |
 | 2 | Установка необходимых утилит (curl, openssl, ufw, qrencode и др.) |
-| 3 | Настройка файрвола UFW: открыть SSH (22), VLESS (443/tcp + 443/udp) |
+| 3 | Настройка файрвола UFW: открыть SSH (определяется автоматически), VLESS (443/tcp) |
 | 4 | Включение BBR — современного алгоритма управления TCP-перегрузкой |
 | 5 | Оптимизация сетевых параметров ядра (TCP-буферы, backlog, лимиты соединений) |
 | 6 | Установка Xray-core через официальный скрипт XTLS |
@@ -38,7 +38,7 @@ Bash-скрипт для автоматической установки и на
 
 ```bash
 # Скачать скрипт
-curl -O https://raw.githubusercontent.com/AndreyBulachev/YourVPN/main/core/ubuntu/setup-vless.sh
+curl -O https://raw.githubusercontent.com/AndreyBulachev/YourVPN/master/core/ubuntu/setup-vless.sh
 
 # Запустить от root
 sudo bash setup-vless.sh
@@ -47,7 +47,7 @@ sudo bash setup-vless.sh
 Или одной командой:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/AndreyBulachev/YourVPN/main/core/ubuntu/setup-vless.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/AndreyBulachev/YourVPN/master/core/ubuntu/setup-vless.sh)"
 ```
 
 > **Важно:** запускайте только на чистом сервере или убедитесь, что порт 443 свободен.
