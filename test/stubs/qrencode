@@ -1,0 +1,4 @@
+#!/bin/bash
+# qrencode stub — terminal QR rendering doesn't work well in CI
+echo "[stub] QR code skipped in Docker test"
+exit 0

@@ -1,0 +1,11 @@
+#!/bin/bash
+# systemctl stub for Docker (no systemd)
+case "${1:-}" in
+    is-active)  echo "active" ;;
+    enable)     echo "[stub] systemctl enable $2" ;;
+    daemon-reload) echo "[stub] systemctl daemon-reload" ;;
+    restart)    echo "[stub] systemctl restart $2" ;;
+    status)     echo "[stub] systemctl status $2" ;;
+    *)          echo "[stub] systemctl $*" ;;
+esac
+exit 0

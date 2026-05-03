@@ -1,0 +1,7 @@
+#!/bin/bash
+# sshd stub for Docker — sshd -T is used to detect SSH port
+if [[ "${1:-}" == "-T" ]]; then
+    echo "port 22"
+else
+    exec /usr/sbin/sshd "$@"
+fi

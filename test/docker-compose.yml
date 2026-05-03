@@ -1,0 +1,8 @@
+services:
+  test:
+    build: .
+    volumes:
+      - ../core:/core:ro
+    # NET_ADMIN needed for ufw stub; SYS_ADMIN for sysctl stub
+    cap_add:
+      - NET_ADMIN

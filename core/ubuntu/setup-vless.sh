@@ -173,12 +173,16 @@ step "Step 6/10 — Generating keys and UUID"
 UUID=$(xray uuid) || die "Failed to generate UUID"
 ok "UUID:       ${UUID}"
 
-KEY_OUTPUT=$(xray x25519) || die "Failed to generate x25519 keypair"
-PRIVATE_KEY=$(awk -F': ' '/[Pp]rivate key/{print $2}' <<< "$KEY_OUTPUT")
-PUBLIC_KEY=$(awk  -F': ' '/[Pp]ublic key/{print $2}'  <<< "$KEY_OUTPUT")
+KEY_OUTPUT=$(xray x25519 2>&1) || die "Failed to generate x25519 keypair"
+PRIVATE_KEY=$(awk -F': ' '/[Pp]rivate key/{print $2; exit}' <<< "$KEY_OUTPUT")
+PUBLIC_KEY=$(awk  -F': ' '/[Pp]ublic key/{print $2; exit}'  <<< "$KEY_OUTPUT")
 
-[[ -z "$PRIVATE_KEY" ]] && die "Could not parse private key from xray x25519 output"
-[[ -z "$PUBLIC_KEY"  ]] && die "Could not parse public key from xray x25519 output"
+if [[ -z "$PRIVATE_KEY" ]]; then
+    die "Could not parse private key from xray x25519 output.\nRaw output was:\n${KEY_OUTPUT}"
+fi
+if [[ -z "$PUBLIC_KEY" ]]; then
+    die "Could not parse public key from xray x25519 output.\nRaw output was:\n${KEY_OUTPUT}"
+fi
 
 ok "Public key: ${PUBLIC_KEY}"
 info "Private key stored only in server config"

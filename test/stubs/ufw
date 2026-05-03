@@ -1,0 +1,4 @@
+#!/bin/bash
+# ufw stub for Docker
+echo "[stub] ufw $*"
+exit 0
